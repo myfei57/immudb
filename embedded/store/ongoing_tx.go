@@ -865,12 +865,13 @@ func (tx *OngoingTx) checkPreconditions(ctx context.Context, st *ImmuStore) erro
 			}
 
 			rspec := KeyReaderSpec{
-				SeekKey:       eReader.spec.SeekKey,
-				EndKey:        eReader.spec.EndKey,
-				Prefix:        eReader.spec.Prefix,
-				InclusiveSeek: eReader.spec.InclusiveSeek,
-				InclusiveEnd:  eReader.spec.InclusiveEnd,
-				DescOrder:     eReader.spec.DescOrder,
+				SeekKey:        eReader.spec.SeekKey,
+				EndKey:         eReader.spec.EndKey,
+				Prefix:         eReader.spec.Prefix,
+				InclusiveSeek:  eReader.spec.InclusiveSeek,
+				InclusiveEnd:   eReader.spec.InclusiveEnd,
+				DescOrder:      eReader.spec.DescOrder,
+				IncludeHistory: eReader.spec.IncludeHistory,
 			}
 
 			reader, err := snap.NewKeyReader(rspec)
@@ -881,40 +882,66 @@ func (tx *OngoingTx) checkPreconditions(ctx context.Context, st *ImmuStore) erro
 			defer reader.Close()
 
 			for _, eReads := range eReader.expectedReads {
-				var key []byte
-				var valRef ValueRef
+				if eReader.spec.IncludeHistory {
+					// History readers emit one entry per (key, tx) version.
+					// Versions written by the ongoing transaction (tx 0) do
+					// not exist in committed history and are validated through
+					// the transaction write-set, so they are skipped without
+					// consuming a committed entry. Every other entry must
+					// match the replayed stream in order, and drained ranges
+					// must still be drained on the sync snapshot.
+					var key []byte
+					var valRef ValueRef
+					var rerr error
 
-				for _, eRead := range eReads {
-
-					if len(key) == 0 {
+					readNext := func(eRead expectedRead) {
 						if eRead.initialTxID == 0 && eRead.finalTxID == 0 {
-							key, valRef, err = reader.Read(ctx)
+							key, valRef, rerr = reader.Read(ctx)
 						} else {
-							key, valRef, err = reader.ReadBetween(ctx, eRead.initialTxID, eRead.finalTxID)
-						}
-
-						if err != nil && !errors.Is(err, ErrNoMoreEntries) {
-							return err
+							key, valRef, rerr = reader.ReadBetween(ctx, eRead.initialTxID, eRead.finalTxID)
 						}
 					}
 
-					if eRead.expectedNoMoreEntries {
-						if err == nil {
-							return fmt.Errorf("%w: fetching more entries than expected", ErrTxReadConflict)
+					for _, eRead := range eReads {
+						if eRead.expectedNoMoreEntries {
+							if rerr == nil && len(key) == 0 {
+								readNext(eRead)
+							}
+
+							if rerr != nil && !errors.Is(rerr, ErrNoMoreEntries) {
+								return rerr
+							}
+
+							if rerr == nil {
+								return fmt.Errorf("%w: fetching more entries than expected", ErrTxReadConflict)
+							}
+
+							continue
 						}
 
-						break
-					}
-
-					if eRead.expectedTx == 0 {
-						if err == nil && bytes.Equal(eRead.expectedKey, key) {
-							// key was updated by the transaction
-							key = nil
-							valRef = nil
+						if eRead.expectedTx == 0 {
+							// RYOW version: no committed counterpart to match.
+							continue
 						}
-					} else {
-						if errors.Is(err, ErrNoMoreEntries) {
-							return fmt.Errorf("%w: fetching less entries than expected", ErrTxReadConflict)
+
+						if rerr != nil {
+							if errors.Is(rerr, ErrNoMoreEntries) {
+								return fmt.Errorf("%w: fetching less entries than expected", ErrTxReadConflict)
+							}
+
+							return rerr
+						}
+
+						if len(key) == 0 {
+							readNext(eRead)
+
+							if errors.Is(rerr, ErrNoMoreEntries) {
+								return fmt.Errorf("%w: fetching less entries than expected", ErrTxReadConflict)
+							}
+
+							if rerr != nil {
+								return rerr
+							}
 						}
 
 						if !bytes.Equal(eRead.expectedKey, key) || eRead.expectedTx != valRef.Tx() {
@@ -923,6 +950,51 @@ func (tx *OngoingTx) checkPreconditions(ctx context.Context, st *ImmuStore) erro
 
 						key = nil
 						valRef = nil
+					}
+				} else {
+					var key []byte
+					var valRef ValueRef
+
+					for _, eRead := range eReads {
+
+						if len(key) == 0 {
+							if eRead.initialTxID == 0 && eRead.finalTxID == 0 {
+								key, valRef, err = reader.Read(ctx)
+							} else {
+								key, valRef, err = reader.ReadBetween(ctx, eRead.initialTxID, eRead.finalTxID)
+							}
+
+							if err != nil && !errors.Is(err, ErrNoMoreEntries) {
+								return err
+							}
+						}
+
+						if eRead.expectedNoMoreEntries {
+							if err == nil {
+								return fmt.Errorf("%w: fetching more entries than expected", ErrTxReadConflict)
+							}
+
+							break
+						}
+
+						if eRead.expectedTx == 0 {
+							if err == nil && bytes.Equal(eRead.expectedKey, key) {
+								// key was updated by the transaction
+								key = nil
+								valRef = nil
+							}
+						} else {
+							if errors.Is(err, ErrNoMoreEntries) {
+								return fmt.Errorf("%w: fetching less entries than expected", ErrTxReadConflict)
+							}
+
+							if !bytes.Equal(eRead.expectedKey, key) || eRead.expectedTx != valRef.Tx() {
+								return fmt.Errorf("%w: fetching a different key or an updated one", ErrTxReadConflict)
+							}
+
+							key = nil
+							valRef = nil
+						}
 					}
 				}
 
