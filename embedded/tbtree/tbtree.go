@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/codenotary/immudb/embedded"
@@ -62,6 +63,13 @@ var (
 	ErrNoMoreEntries                 = fmt.Errorf("tbtree: %w", embedded.ErrNoMoreEntries)
 	ErrReadersNotClosed              = errors.New("tbtree: readers not closed")
 )
+
+// storageGenCounter assigns a process-unique storage generation to every
+// opened TBtree. Equal node offsets in different generations (e.g. after
+// reopen or loading a compacted dump) must not be treated as the same
+// immutable node, so identity checks compare the generation in addition
+// to the offset.
+var storageGenCounter atomic.Uint64
 
 const Version = 3
 
@@ -237,6 +245,10 @@ type TBtree struct {
 	minOffset         int64
 
 	compacting bool
+
+	// storageGen uniquely identifies the in-process generation of this
+	// TBtree's append-only nodes log.
+	storageGen uint64
 
 	closed  bool
 	rwmutex sync.RWMutex
@@ -620,9 +632,11 @@ func OpenWith(path, tsFile string, nLog, hLog, cLog appendable.Appendable, opts 
 		commitLogMaxOpenedFiles:  opts.commitLogMaxOpenedFiles,
 		readOnly:                 opts.readOnly,
 		appFactory:               opts.appFactory,
-		appRemove:                opts.appRemove,
-		snapshots:                make(map[uint64]*Snapshot),
+		appRemove:                 opts.appRemove,
+		snapshots:                 make(map[uint64]*Snapshot),
 	}
+
+	t.storageGen = storageGenCounter.Add(1)
 
 	var validatedCLogEntry *cLogEntry
 	discardedCLogEntries := 0
