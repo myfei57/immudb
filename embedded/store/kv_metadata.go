@@ -107,6 +107,32 @@ func NewKVMetadata() *KVMetadata {
 	}
 }
 
+// Copy returns a deep, independently-owned copy of md. Mutating the returned
+// metadata (or the original one) never affects the other instance. A nil
+// input returns nil. It is used by the OngoingTx savepoint undo journal so
+// that caller-driven changes to a live metadata object cannot corrupt the
+// state captured by a savepoint.
+func (md *KVMetadata) Copy() *KVMetadata {
+	if md == nil {
+		return nil
+	}
+
+	c := NewKVMetadata()
+
+	for attrCode, attr := range md.attributes {
+		switch a := attr.(type) {
+		case *deletedAttribute:
+			c.attributes[attrCode] = &deletedAttribute{}
+		case *expiresAtAttribute:
+			c.attributes[attrCode] = &expiresAtAttribute{expiresAt: a.expiresAt}
+		case *nonIndexableAttribute:
+			c.attributes[attrCode] = &nonIndexableAttribute{}
+		}
+	}
+
+	return c
+}
+
 func newReadOnlyKVMetadata() *KVMetadata {
 	return &KVMetadata{
 		attributes: make(map[attributeCode]attribute),

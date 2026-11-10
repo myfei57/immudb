@@ -56,6 +56,28 @@ type OngoingTx struct {
 	ts time.Time
 
 	closed bool
+
+	// Savepoint support. The undo journal is incremental: one record per
+	// mutation performed while a savepoint is live, never a full copy of
+	// the transaction state per savepoint.
+	txTokenID        uint64
+	nextSavepointGen uint64
+	savepoints       map[uint64]*savepointState
+	undoJournal      []undoFn
+	journalBase      uint64 // absolute sequence number of undoJournal[0]
+	// hiddenKeys holds key hashes whose snapshot placeholder insertion was
+	// undone by a savepoint rollback and which must therefore read as
+	// absent until they are written again or the transaction ends.
+	hiddenKeys map[[sha256.Size]byte]struct{}
+	// overlayRestored holds the previous snapshot indexed values for keys
+	// whose in-tx placeholder overlay was undone by a savepoint rollback.
+	// The interceptor rebuilds the corresponding value references from them.
+	overlayRestored map[[sha256.Size]byte]restoredOverlay
+	// undoRecordCount counts every journal record ever appended, and
+	// undoOwnedBytes the bytes deep-copied to give journaled specs
+	// independent ownership. Both back in-package cost accounting tests.
+	undoRecordCount uint64
+	undoOwnedBytes  int
 }
 
 type mvccReadSet struct {
@@ -140,6 +162,7 @@ func newOngoingTx(ctx context.Context, s *ImmuStore, opts *TxOptions) (*OngoingT
 		entriesByKey:     make(map[[sha256.Size]byte]int),
 		ts:               time.Now(),
 		unsafeMVCC:       opts.UnsafeMVCC,
+		txTokenID:        ongoingTxTokenCounter.Add(1),
 	}
 
 	tx.mode = opts.Mode
@@ -242,8 +265,25 @@ func (tx *OngoingTx) snap(key []byte) (*Snapshot, error) {
 	// using an "interceptor" to construct the valueRef from current entries
 	// so to avoid storing more data into the snapshot
 	snap.refInterceptor = func(key []byte, valRef ValueRef) ValueRef {
-		keyRef, ok := tx.entriesByKey[sha256.Sum256(key)]
+		kid := sha256.Sum256(key)
+
+		keyRef, ok := tx.entriesByKey[kid]
 		if !ok {
+			// The snapshot may still hold a placeholder for a key whose
+			// insertion was undone by a savepoint rollback: surface it as
+			// absent until the key is written again.
+			if tx.isKeyHidden(kid) {
+				return hiddenSnapshotValRef
+			}
+
+			// A rolled-back overlay over a pre-existent key: rebuild the
+			// value reference from the captured pre-overlay indexed value.
+			if restored, ok := tx.overlayRestored[kid]; ok {
+				if ref, err := snap.st.valueRefFrom(restored.ts, restored.hc, restored.indexedVal); err == nil {
+					return ref
+				}
+			}
+
 			return valRef
 		}
 
@@ -307,6 +347,23 @@ func (tx *OngoingTx) set(key []byte, md *KVMetadata, value []byte, hashValue [sh
 		IsValueTruncated: isValueTruncated,
 	}
 
+	if tx.journalingActive() {
+		// While a savepoint is live, take independent ownership of every
+		// incoming spec up-front: later caller mutations of the passed
+		// slices or buffer reuse after a rollback must never corrupt state
+		// that rollback may have to observe. The cost is per write, never a
+		// full transaction copy at savepoint creation.
+		e = &EntrySpec{
+			Key:              cp(key),
+			Metadata:         md.Copy(),
+			Value:            cp(value),
+			HashValue:        hashValue,
+			IsValueTruncated: isValueTruncated,
+		}
+
+		tx.undoOwnedBytes += len(key) + len(value)
+	}
+
 	// vLen=0 + vOff=0 + vHash=0 + txmdLen=0 + kvmdLen=0
 	var indexedValue [lszSize + offsetSize + sha256.Size + sszSize + sszSize]byte
 
@@ -349,6 +406,13 @@ func (tx *OngoingTx) set(key []byte, md *KVMetadata, value []byte, hashValue [sh
 				return err
 			}
 
+			// Capture how to undo the snapshot overlay BEFORE the overlay
+			// replaces the previous indexed value. No-op when no savepoint
+			// is live.
+			if err = tx.journalOverlayMutation(snap, targetKey); err != nil {
+				return err
+			}
+
 			err = snap.set(targetKey, indexedValue[:])
 			if err != nil {
 				return err
@@ -360,7 +424,13 @@ func (tx *OngoingTx) set(key []byte, md *KVMetadata, value []byte, hashValue [sh
 			keyRef, isKeyUpdate := tx.entriesByKey[kid]
 
 			if isKeyUpdate {
+				old := tx.transientEntries[keyRef]
+
 				tx.transientEntries[keyRef] = e
+
+				if tx.journalingActive() {
+					tx.journalTransientUpdate(keyRef, old)
+				}
 			} else {
 				// Transient entries live in their own negative keyRef
 				// space so they never collide with non-transient keyRefs
@@ -373,15 +443,31 @@ func (tx *OngoingTx) set(key []byte, md *KVMetadata, value []byte, hashValue [sh
 				tkey := -(len(tx.transientEntries) + 1)
 				tx.transientEntries[tkey] = e
 				tx.entriesByKey[kid] = tkey
+
+				if tx.journalingActive() {
+					tx.journalTransientAdd(kid, tkey)
+				}
 			}
 		}
 	}
 
 	if isKeyUpdate {
 		if isTransient {
+			old := tx.transientEntries[keyRef]
+
 			tx.transientEntries[keyRef] = e
+
+			if tx.journalingActive() {
+				tx.journalTransientUpdate(keyRef, old)
+			}
 		} else {
+			old := tx.entries[keyRef]
+
 			tx.entries[keyRef] = e
+
+			if tx.journalingActive() {
+				tx.journalEntryUpdate(keyRef, old)
+			}
 		}
 	} else {
 		if isTransient {
@@ -390,9 +476,19 @@ func (tx *OngoingTx) set(key []byte, md *KVMetadata, value []byte, hashValue [sh
 			tkey := -(len(tx.transientEntries) + 1)
 			tx.transientEntries[tkey] = e
 			tx.entriesByKey[kid] = tkey
+
+			if tx.journalingActive() {
+				tx.journalTransientAdd(kid, tkey)
+			}
 		} else {
 			tx.entries = append(tx.entries, e)
-			tx.entriesByKey[kid] = len(tx.entries) - 1
+
+			idx := len(tx.entries) - 1
+			tx.entriesByKey[kid] = idx
+
+			if tx.journalingActive() {
+				tx.journalEntryAppend(kid, idx)
+			}
 		}
 
 	}
@@ -431,7 +527,15 @@ func (tx *OngoingTx) AddPrecondition(c Precondition) error {
 		return err
 	}
 
+	precondLen := len(tx.preconditions)
 	tx.preconditions = append(tx.preconditions, c)
+
+	if tx.journalingActive() {
+		tx.appendUndo(func() {
+			tx.preconditions = tx.preconditions[:precondLen]
+		})
+	}
+
 	return nil
 }
 
@@ -747,6 +851,10 @@ func (tx *OngoingTx) commit(ctx context.Context, waitForIndexing bool) (*TxHeade
 
 	tx.closed = true
 
+	// The transaction is ending: drop every undo journal record and
+	// savepoint token so their captured memory can be reclaimed.
+	tx.releaseSavepointState()
+
 	if tx.IsReadOnly() {
 		return nil, ErrReadOnlyTx
 	}
@@ -764,6 +872,10 @@ func (tx *OngoingTx) Cancel() error {
 	}
 
 	tx.closed = true
+
+	// Releasing all savepoint journals and tokens together with the
+	// transaction snapshots.
+	tx.releaseSavepointState()
 
 	if !tx.IsWriteOnly() {
 		for _, snap := range tx.snapshots {

@@ -96,7 +96,14 @@ func (s *Snapshot) GetBetween(ctx context.Context, key []byte, initialTxID, fina
 	}
 
 	if s.refInterceptor != nil {
-		return s.refInterceptor(key, valRef), nil
+		valRef = s.refInterceptor(key, valRef)
+
+		// a hidden key behaves as if it was never present in the snapshot
+		if isHiddenSnapshotValRef(valRef) {
+			return nil, ErrKeyNotFound
+		}
+
+		return valRef, nil
 	}
 
 	return valRef, nil
@@ -125,7 +132,14 @@ func (s *Snapshot) GetWithFilters(ctx context.Context, key []byte, filters ...Fi
 	}
 
 	if s.refInterceptor != nil {
-		return s.refInterceptor(key, valRef), nil
+		valRef = s.refInterceptor(key, valRef)
+
+		// a hidden key behaves as if it was never present in the snapshot
+		if isHiddenSnapshotValRef(valRef) {
+			return nil, ErrKeyNotFound
+		}
+
+		return valRef, nil
 	}
 
 	return valRef, nil
@@ -158,7 +172,14 @@ func (s *Snapshot) GetWithPrefixAndFilters(ctx context.Context, prefix []byte, n
 	}
 
 	if s.refInterceptor != nil {
-		return key, s.refInterceptor(key, valRef), nil
+		valRef = s.refInterceptor(key, valRef)
+
+		// a hidden key behaves as if it was never present in the snapshot
+		if isHiddenSnapshotValRef(valRef) {
+			return nil, nil, ErrKeyNotFound
+		}
+
+		return key, valRef, nil
 	}
 
 	return key, valRef, nil
@@ -180,6 +201,11 @@ func (s *Snapshot) History(key []byte, offset uint64, descOrder bool, limit int)
 
 		if s.refInterceptor != nil {
 			valRef = s.refInterceptor(key, valRef)
+
+			// skip placeholders of keys whose insertion was rolled back
+			if isHiddenSnapshotValRef(valRef) {
+				continue
+			}
 		}
 
 		valRefs[i] = valRef
@@ -421,6 +447,11 @@ func (r *storeKeyReader) ReadBetween(ctx context.Context, initialTxID, finalTxID
 
 		valRef := r.refInterceptor(key, val)
 
+		// hide placeholders of entries undone by a savepoint rollback
+		if isHiddenSnapshotValRef(valRef) {
+			continue
+		}
+
 		filterEntry := false
 
 		if !r.includeHistory {
@@ -462,6 +493,11 @@ func (r *storeKeyReader) Read(ctx context.Context) (key []byte, val ValueRef, er
 		}
 
 		valRef := r.refInterceptor(key, val)
+
+		// hide placeholders of entries undone by a savepoint rollback
+		if isHiddenSnapshotValRef(valRef) {
+			continue
+		}
 
 		filterEntry := false
 
